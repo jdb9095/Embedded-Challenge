@@ -1,0 +1,37 @@
+Embedded Challenge Fall 2025 Term Project Group 3
+
+Members:
+    Boao Li
+    Henry Cao
+    Jayshawn Brown
+    Yukang Yan
+    Zhiyun He
+
+Meeting 1 - Dec, 2nd
+    Pending tasks with priority(P0, P1, P2)
+        1. BLE communication - P0 (Henry, Yukang)
+            BLE service
+            Data transmission logic: when to update
+            Three characteristics
+        2. User Interfaces - P0 (Zhiyun, Boao)
+            Visual feedback: system status and detected conditions (e.g. Blue=Tremor, Yellow=Dyskinesia, Red=FOG)
+            User control: buttons to start/stop monitoring, reset, or cycle through modes
+            Audio feedback: short beeps for alerts if a buzzer is available
+        3. Power management - P2
+            Low-power mode when Idle
+        4. Code review - P2
+
+
+
+
+
+Meeting 2 - Dec, 5th
+    Progress Checking
+
+Meeting 3
+
+
+# Notes: Due date changed to Dec, 16th
+
+
+
