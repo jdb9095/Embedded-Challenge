@@ -21,14 +21,23 @@ Meeting 1 - Dec, 2nd
             Low-power mode when Idle
         4. Code review - P2
 
-
-
-
-
 Meeting 2 - Dec, 5th
-    Progress Checking
+    Progress Checking...
+        1. BLE communication (Henry, Yukang)
+            Reconnection - P0
+        2. User Interfaces - P0 (Zhiyun, Boao)
+            Visual feedback: system status and detected conditions (e.g. Blue=Tremor, Yellow=Dyskinesia, Red=FOG)
+            User control: buttons to start/stop monitoring, reset, or cycle through modes
+            Audio feedback: short beeps for alerts if a buzzer is available
+        3. Robustness on Three main characteristics - P0 (Jayshawn)
 
-Meeting 3
+
+    Unknown bugs: BLE Connected but no updates - P0
+
+Meeting 3 - Dec, 8th 
+    Hopefully done on Monday
+
+
 
 
 # Notes: Due date changed to Dec, 16th
