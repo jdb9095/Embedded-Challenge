@@ -44,6 +44,24 @@ static GattCharacteristic *tremorCharPtr = nullptr;
 static GattCharacteristic *dyskCharPtr = nullptr;
 static GattCharacteristic *freezeCharPtr = nullptr;
 
+// Manage BLE reconnection
+class MyGapEventHandler : public ble::Gap::EventHandler {
+public:
+    void onConnectionComplete(const ble::ConnectionCompleteEvent &event) override {
+        (void)event;
+        printf("BLE connected\r\n");
+    }
+
+    void onDisconnectionComplete(const ble::DisconnectionCompleteEvent &event) override {
+        (void)event;
+        printf("BLE disconnected, restarting advertising\r\n");
+        // Restart advertising on disconnection
+        ble::BLE::Instance().gap().startAdvertising(ble::LEGACY_ADVERTISING_HANDLE);
+    }
+};
+
+static MyGapEventHandler gap_event_handler;
+
 // Forward declarations for BLE callbacks
 void schedule_ble_events(ble::BLE::OnEventsToProcessCallbackContext*);
 void on_ble_init_complete(ble::BLE::InitializationCompleteCallbackContext*);
@@ -155,7 +173,7 @@ int main(){
                 tremor_val = (state == TREMOR) ? 1 : 0;
                 dyskinesia_val = (state == DYSKINESIA) ? 1 : 0;
                 freeze_val = (move_state == FREEZED) ? 1 : 0;
-
+                
                 if (tremorCharPtr) ble_instance.gattServer().write(tremorCharPtr->getValueHandle(), &tremor_val, sizeof(tremor_val));
                 if (dyskCharPtr)  ble_instance.gattServer().write(dyskCharPtr->getValueHandle(),  &dyskinesia_val, sizeof(dyskinesia_val));
                 if (freezeCharPtr)ble_instance.gattServer().write(freezeCharPtr->getValueHandle(), &freeze_val, sizeof(freeze_val));
@@ -396,6 +414,8 @@ void on_ble_init_complete(ble::BLE::InitializationCompleteCallbackContext* param
 
     // Build advertising payload using AdvertisingDataBuilder
     Gap &gap = local_ble.gap();
+    // handle disconnnection and restart advertising
+    gap.setEventHandler(&gap_event_handler);
     const uint8_t service_uuid_bytes[16] = { 0xFB,0x34,0x9B,0x5F,0x80,0x00,0x00,0x80,0x00,0x10,0x00,0x00,0xA0,0x00,0x00,0x00 };
     uint8_t adv_buffer[ble::LEGACY_ADVERTISING_MAX_SIZE];
     ble::AdvertisingDataBuilder adv_builder(adv_buffer);
