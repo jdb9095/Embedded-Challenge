@@ -1,6 +1,9 @@
 // Included libraries
 #include "mbed.h" // Main Mbed OS library
 #include "arm_math.h" // CMSIS-DSP library
+#include <cmath>
+
+using namespace std::chrono_literals; // for 19ms literal
 
 // LSM6DSL Register Definitions
 #define WHO_AM_I     (0x0F) // ID register - should return 0x6A
@@ -20,6 +23,10 @@
 // Objects
 arm_rfft_fast_instance_f32 S; // FFT instance
 I2C i2c(PB_11, PB_10);  // I2C2: SDA = PB11, SCL = PB10
+
+// ---- UI objects (LED + Button) ----
+DigitalOut status_led(LED1);   // single on-board LED
+DigitalIn  user_button(BUTTON1); // USER button (active-low)
 
 // Frequency states
 typedef enum{
@@ -57,6 +64,11 @@ float fft_output[FFT_SIZE];
 float fft_mag[FFT_SIZE / 2];
 int fft_idx = 0;
 
+// ---- Extra globals for UI ----
+OscillationState g_osc_state = NORMAL;
+MovementState    g_move_state = IDLE;
+bool g_reset_flag = false; // set by long button press
+
 // Function prototypes
 void write_register( uint8_t reg, uint8_t value );
 uint8_t read_register( uint8_t reg );
@@ -65,6 +77,10 @@ bool configure_device();
 void fft( float input_signal );
 OscillationState determine_oscillation_state( float frequency );
 MovementState determine_movement_state( float frequency );
+
+// UI helpers
+void update_led_pattern();
+void handle_button();
 
 int main(){
 
@@ -103,6 +119,7 @@ int main(){
             // Determine oscillation state
             OscillationState state = determine_oscillation_state( current_dominant_freq );
 
+            // --- keep EXACT same prints as original ---
             if( state == NORMAL ) printf("NORMAL (%.2f Hz)\r\n", current_dominant_freq);
             else if( state == TREMOR ) printf("TREMOR (%.2f Hz)\r\n", current_dominant_freq);
             else if( state == DYSKINESIA ) printf("DYSKINESIA (%.2f Hz)\r\n", current_dominant_freq);
@@ -114,7 +131,17 @@ int main(){
             else if( move_state == WALKING ) printf("Movement State: WALKING\r\n");
             else if( move_state == FREEZED ) printf("Movement State: FREEZED\r\n");
 
+            // Save states for LED UI
+            g_osc_state  = state;
+            g_move_state = move_state;
+
         }
+
+        // Handle long-press button reset (no change to prints)
+        handle_button();
+
+        // Update LED pattern based on latest states
+        update_led_pattern();
 
         // Wait before next sample
         ThisThread::sleep_for(19ms); // ~19ms for 52Hz sampling
@@ -233,10 +260,18 @@ MovementState determine_movement_state( float frequency ){
     static MovementState current_state = IDLE;
 
     // Initalize iniitial previous frequency
-    static float prev_dominant_freq = 0.0f;
+    static float prev_dominant_freq_local = 0.0f;
+
+    // ---- handle reset request from long button press ----
+    if (g_reset_flag) {
+        current_state = IDLE;
+        prev_dominant_freq_local = 0.0f;
+        g_reset_flag = false;
+        return current_state;
+    }
 
     // Calculate frequency change 
-    float delta = frequency - prev_dominant_freq;
+    float delta = frequency - prev_dominant_freq_local;
 
     switch (current_state) {
 
@@ -284,12 +319,129 @@ MovementState determine_movement_state( float frequency ){
     }
 
     // Save previous frequency
-    prev_dominant_freq = frequency;
+    prev_dominant_freq_local = frequency;
 
     // Return current state
     return current_state;
     
 }
+
+// -------- LED UI: use g_osc_state + g_move_state to drive a single LED --------
+// Priority: FREEZED (FOG) > DYSKINESIA > TREMOR > WALKING > IDLE/NORMAL
+void update_led_pattern() {
+
+    const int TICK_MS = 19;  // called once per loop
+
+    static int elapsed_ms = 0;
+    static int last_mode  = -1;
+
+    // mode:
+    // 0 = IDLE/NORMAL
+    // 1 = WALKING
+    // 2 = TREMOR
+    // 3 = DYSKINESIA
+    // 4 = FREEZED
+    int mode = 0;
+
+    if (g_move_state == FREEZED) {
+        mode = 4;
+    } else if (g_osc_state == DYSKINESIA) {
+        mode = 3;
+    } else if (g_osc_state == TREMOR) {
+        mode = 2;
+    } else if (g_move_state == WALKING) {
+        mode = 1;
+    } else {
+        mode = 0;
+    }
+
+    if (mode != last_mode) {
+        elapsed_ms = 0;
+        last_mode  = mode;
+    } else {
+        elapsed_ms += TICK_MS;
+    }
+
+    switch (mode) {
+
+        case 4: {
+            // FREEZED (FOG): very slow blink (1s ON, 1s OFF)
+            int period  = 2000;
+            int on_time = 1000;
+            int t = elapsed_ms % period;
+            status_led = (t < on_time) ? 1 : 0;
+            break;
+        }
+
+        case 3: {
+            // DYSKINESIA: double-flash (ON 100ms, OFF 100ms, ON 100ms, OFF 500ms)
+            int period = 800;
+            int t = elapsed_ms % period;
+            if ((t < 100) || (t >= 200 && t < 300)) {
+                status_led = 1;
+            } else {
+                status_led = 0;
+            }
+            break;
+        }
+
+        case 2: {
+            // TREMOR: fast blink (~4 Hz)
+            int period  = 250;
+            int on_time = 125;
+            int t = elapsed_ms % period;
+            status_led = (t < on_time) ? 1 : 0;
+            break;
+        }
+
+        case 1: {
+            // WALKING: solid ON
+            status_led = 1;
+            break;
+        }
+
+        case 0:
+        default: {
+            // IDLE / NORMAL: LED OFF
+            status_led = 0;
+            break;
+        }
+    }
+}
+
+// -------- Button handling: long press -> reset states --------
+//  - short press: ignored
+//  - long press (~>=600ms): set g_reset_flag, real reset done in determine_movement_state()
+void handle_button() {
+
+    static bool prev_pressed = false;
+    static int  press_ticks  = 0;
+
+    // BUTTON1 is active-low (pressed = 0)
+    bool pressed = (user_button.read() == 0);
+
+    if (pressed) {
+        press_ticks++;
+    }
+
+    // Just released
+    if (!pressed && prev_pressed) {
+
+        int duration_ms = press_ticks * 19; // approximate duration in ms
+
+        if (duration_ms >= 600) {
+            // Long press detected: request reset of movement state machine
+            g_reset_flag = true;
+            printf("[BUTTON] Long press detected. Resetting states...\r\n");
+        }
+
+        // Reset counter after release
+        press_ticks = 0;
+    }
+
+    prev_pressed = pressed;
+}
+
 
 /* maybe not needed
 
