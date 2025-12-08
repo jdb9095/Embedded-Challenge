@@ -1,6 +1,13 @@
 // Included libraries
 #include "mbed.h" // Main Mbed OS library
 #include "arm_math.h" // CMSIS-DSP library
+// BLE includes
+#include "events/mbed_events.h"
+#include "ble/BLE.h"
+#include "ble/GattServer.h"
+#include "ble/Gap.h"
+// Advertising builder helper
+#include "ble/gap/AdvertisingDataBuilder.h"
 #include <cmath>
 
 using namespace std::chrono_literals; // for 19ms literal
@@ -27,6 +34,44 @@ I2C i2c(PB_11, PB_10);  // I2C2: SDA = PB11, SCL = PB10
 // ---- UI objects (LED + Button) ----
 DigitalOut status_led(LED1);   // single on-board LED
 DigitalIn  user_button(BUTTON1); // USER button (active-low)
+
+// BLE / GATT globals
+static events::EventQueue event_queue(16 * EVENTS_EVENT_SIZE);
+// Rename BLE instance variable to avoid collision with the `ble` namespace
+static ble::BLE &ble_instance = ble::BLE::Instance();
+static bool ble_ready = false;
+
+// Characteristic values (0 = not present, 1 = present)
+static uint8_t tremor_val = 0;
+static uint8_t dyskinesia_val = 0;
+static uint8_t freeze_val = 0;
+
+// Characteristic pointers (allocated during BLE init)
+static GattCharacteristic *tremorCharPtr = nullptr;
+static GattCharacteristic *dyskCharPtr = nullptr;
+static GattCharacteristic *freezeCharPtr = nullptr;
+
+// Manage BLE reconnection
+class MyGapEventHandler : public ble::Gap::EventHandler {
+public:
+    void onConnectionComplete(const ble::ConnectionCompleteEvent &event) override {
+        (void)event;
+        printf("BLE connected\r\n");
+    }
+
+    void onDisconnectionComplete(const ble::DisconnectionCompleteEvent &event) override {
+        (void)event;
+        printf("BLE disconnected, restarting advertising\r\n");
+        // Restart advertising on disconnection
+        ble::BLE::Instance().gap().startAdvertising(ble::LEGACY_ADVERTISING_HANDLE);
+    }
+};
+
+static MyGapEventHandler gap_event_handler;
+
+// Forward declarations for BLE callbacks
+void schedule_ble_events(ble::BLE::OnEventsToProcessCallbackContext*);
+void on_ble_init_complete(ble::BLE::InitializationCompleteCallbackContext*);
 
 // Frequency states
 typedef enum{
@@ -93,6 +138,14 @@ int main(){
     }
 
     // Initialize the FFT library
+
+    // Initialize BLE
+    // start event queue in a background thread so BLE events are processed
+    static Thread ble_event_thread;
+    ble_event_thread.start(callback(&event_queue, &events::EventQueue::dispatch_forever));
+    ble_instance.onEventsToProcess(schedule_ble_events);
+    ble_instance.init(on_ble_init_complete);
+
     arm_rfft_fast_init_f32(&S, FFT_SIZE);
 
     // Sample interval counter
@@ -130,6 +183,18 @@ int main(){
             if( move_state == IDLE ) printf("Movement State: IDLE\r\n");
             else if( move_state == WALKING ) printf("Movement State: WALKING\r\n");
             else if( move_state == FREEZED ) printf("Movement State: FREEZED\r\n");
+
+            // Update BLE characteristics (if BLE initialized)
+            if (ble_ready) {
+                // Tremor characteristic: set to 1 when oscillation in tremor range
+                tremor_val = (state == TREMOR) ? 1 : 0;
+                dyskinesia_val = (state == DYSKINESIA) ? 1 : 0;
+                freeze_val = (move_state == FREEZED) ? 1 : 0;
+                
+                if (tremorCharPtr) ble_instance.gattServer().write(tremorCharPtr->getValueHandle(), &tremor_val, sizeof(tremor_val));
+                if (dyskCharPtr)  ble_instance.gattServer().write(dyskCharPtr->getValueHandle(),  &dyskinesia_val, sizeof(dyskinesia_val));
+                if (freezeCharPtr)ble_instance.gattServer().write(freezeCharPtr->getValueHandle(), &freeze_val, sizeof(freeze_val));
+            }
 
             // Save states for LED UI
             g_osc_state  = state;
@@ -470,3 +535,57 @@ float gyro_magnitude = sqrtf( gyro_x_dps * gyro_x_dps + gyro_y_dps * gyro_y_dps 
 fft( gyro_magnitude );
 
 */
+
+// Schedule BLE events on the event queue
+void schedule_ble_events(ble::BLE::OnEventsToProcessCallbackContext* context) {
+    event_queue.call(callback(&ble::BLE::Instance(), &ble::BLE::processEvents));
+}
+
+// BLE initialization complete - create GATT service and start advertising
+void on_ble_init_complete(ble::BLE::InitializationCompleteCallbackContext* params) {
+
+    if (params->error) {
+        printf("BLE initialization failed\r\n");
+        return;
+    }
+
+    ble::BLE &local_ble = params->ble;
+
+    // Create three characteristics (tremor, dyskinesia, freezing gait)
+    tremorCharPtr = new GattCharacteristic(UUID("0000a001-0000-1000-8000-00805f9b34fb"), &tremor_val, sizeof(tremor_val), sizeof(tremor_val), GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_NOTIFY | GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_READ);
+    dyskCharPtr   = new GattCharacteristic(UUID("0000a002-0000-1000-8000-00805f9b34fb"), &dyskinesia_val, sizeof(dyskinesia_val), sizeof(dyskinesia_val), GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_NOTIFY | GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_READ);
+    freezeCharPtr = new GattCharacteristic(UUID("0000a003-0000-1000-8000-00805f9b34fb"), &freeze_val, sizeof(freeze_val), sizeof(freeze_val), GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_NOTIFY | GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_READ);
+
+    GattCharacteristic *char_table[] = { tremorCharPtr, dyskCharPtr, freezeCharPtr };
+
+    // Custom service UUID(Testing needed)
+    const UUID service_uuid("0000a000-0000-1000-8000-00805f9b34fb");
+    GattService custom_service(service_uuid, char_table, sizeof(char_table) / sizeof(char_table[0]));
+
+    local_ble.gattServer().addService(custom_service);
+
+    // Build advertising payload using AdvertisingDataBuilder
+    Gap &gap = local_ble.gap();
+    // handle disconnnection and restart advertising
+    gap.setEventHandler(&gap_event_handler);
+    const uint8_t service_uuid_bytes[16] = { 0xFB,0x34,0x9B,0x5F,0x80,0x00,0x00,0x80,0x00,0x10,0x00,0x00,0xA0,0x00,0x00,0x00 };
+    uint8_t adv_buffer[ble::LEGACY_ADVERTISING_MAX_SIZE];
+    ble::AdvertisingDataBuilder adv_builder(adv_buffer);
+    adv_builder.clear();
+    adv_builder.setFlags();
+
+    // Add 128-bit service UUID using mbed::Span
+    mbed::Span<const unsigned char> svc_span(reinterpret_cast<const unsigned char*>(service_uuid_bytes), sizeof(service_uuid_bytes));
+    adv_builder.addData(ble::adv_data_type_t::COMPLETE_LIST_128BIT_SERVICE_IDS, svc_span);
+
+    // Set advertising parameters for legacy connectable undirected advertising
+    gap.setAdvertisingParameters(ble::LEGACY_ADVERTISING_HANDLE, ble::AdvertisingParameters(ble::advertising_type_t::CONNECTABLE_UNDIRECTED));
+
+    // Set payload and start advertising using the legacy advertising handle
+    gap.setAdvertisingPayload(ble::LEGACY_ADVERTISING_HANDLE, adv_builder.getAdvertisingData());
+    gap.startAdvertising(ble::LEGACY_ADVERTISING_HANDLE);
+
+    ble_ready = true;
+    printf("BLE initialization SUCCESS!\r\n");
+
+}
