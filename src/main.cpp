@@ -9,18 +9,26 @@
 // Advertising builder helper
 #include "ble/gap/AdvertisingDataBuilder.h"
 #include <cmath>
+#include <string.h>  // ADDED: for strcpy, strlen
 
 using namespace std::chrono_literals; // for 19ms literal
 
 // LSM6DSL Register Definitions
 #define WHO_AM_I     (0x0F) // ID register - should return 0x6A
 #define CTRL1_XL     (0x10) // Accelerometer control register to configure range
+#define CTRL2_G      (0x11) // Gyroscope control register to configure range
 #define OUTX_L_XL    (0x28) // XL X-axis (low byte)
 #define OUTX_H_XL    (0x29) // XL X-axis (high byte)
 #define OUTY_L_XL    (0x2A) // XL Y-axis (low byte)
 #define OUTY_H_XL    (0x2B) // XL Y-axis (high byte)
 #define OUTZ_L_XL    (0x2C) // XL Z-axis (low byte)
 #define OUTZ_H_XL    (0x2D) // XL Z-axis (high byte)
+#define OUTX_L_G     (0x22) // Gyro X-axis (low byte)
+#define OUTX_H_G     (0x23) // Gyro X-axis (high byte)
+#define OUTY_L_G     (0x24) // Gyro Y-axis (low byte)
+#define OUTY_H_G     (0x25) // Gyro Y-axis (high byte)
+#define OUTZ_L_G     (0x26) // Gyro Z-axis (low byte)
+#define OUTZ_H_G     (0x27) // Gyro Z-axis (high byte)
 #define LSM6DSL_ADDR (0x6A << 1) // Equals 0xD4
 
 // DSP Parameters
@@ -41,15 +49,17 @@ static events::EventQueue event_queue(16 * EVENTS_EVENT_SIZE);
 static ble::BLE &ble_instance = ble::BLE::Instance();
 static bool ble_ready = false;
 
-// Characteristic values (0 = not present, 1 = present)
-static uint8_t tremor_val = 0;
-static uint8_t dyskinesia_val = 0;
-static uint8_t freeze_val = 0;
+// MODIFIED: Symptom string constants and buffer for BLE
+const char* SYMPTOM_NONE = "NONE";
+const char* SYMPTOM_TREMOR = "TREMOR";
+const char* SYMPTOM_DYSKINESIA = "DYSKINESIA";
+const char* SYMPTOM_FOG = "FOG";
 
-// Characteristic pointers (allocated during BLE init)
-static GattCharacteristic *tremorCharPtr = nullptr;
-static GattCharacteristic *dyskCharPtr = nullptr;
-static GattCharacteristic *freezeCharPtr = nullptr;
+#define MAX_SYMPTOM_LEN 12
+static uint8_t symptom_string[MAX_SYMPTOM_LEN];
+
+// MODIFIED: Single characteristic pointer for symptom string
+static GattCharacteristic *symptomCharPtr = nullptr;
 
 // Manage BLE reconnection
 class MyGapEventHandler : public ble::Gap::EventHandler {
@@ -94,6 +104,7 @@ typedef enum{
 
 // Global variables
 const float ACC_SENSITIVITY = 0.061f; // mg/LSB for ±2g
+const float GYRO_SENSITIVITY = 8.75f; // mdps/LSB for ±250 dps
 const float FREQ_BIN_SIZE = SAMPLE_RATE / FFT_SIZE; // Derived Resolution: 52 / 128 = 0.40625 Hz per bin
 const float WALK_MIN_FREQ = 1.0f; // walking band lower bound
 const float WALK_MAX_FREQ = 3.0f; // walking band upper bound
@@ -101,6 +112,7 @@ const float LOW_FREQ_TH   = 1.0f; // not walking
 const float BIG_DROP_TH   = -1.0f; // big decrease
 const float BIG_CHANGE_TH =  0.5f; // noticeable change
 volatile float current_dominant_freq = 0.0f; // Holds calculated frequency for printing
+volatile float current_fft_magnitude = 0.0f; // ADDED: Holds FFT magnitude for intensity
 volatile float prev_dominant_freq = 0.0f; // Holds frequency captured for processing
 
 // FFT Buffers
@@ -108,6 +120,14 @@ float fft_input[FFT_SIZE];
 float fft_output[FFT_SIZE];
 float fft_mag[FFT_SIZE / 2];
 int fft_idx = 0;
+
+// ---- ADDED: Step detection variables ----
+volatile int step_count = 0;          // Total steps
+volatile int steps_in_window = 0;     // Steps in current 3-second window
+float acc_vertical_prev = 1.0f;       // Previous vertical acceleration
+float acc_vertical_avg = 1.0f;        // Running average for baseline
+bool step_detected = false;           // Flag for step state machine
+int step_cooldown = 0;                // Cooldown counter between steps
 
 // ---- Extra globals for UI ----
 OscillationState g_osc_state = NORMAL;
@@ -121,7 +141,9 @@ int16_t read_16bit_value( uint8_t reg_low, uint8_t reg_high );
 bool configure_device();
 void fft( float input_signal );
 OscillationState determine_oscillation_state( float frequency );
-MovementState determine_movement_state( float frequency );
+MovementState determine_movement_state( float frequency, int steps );
+void detect_step( float acc_z );  // ADDED
+uint8_t calculate_intensity( float magnitude );  // ADDED
 
 // UI helpers
 void update_led_pattern();
@@ -137,8 +159,6 @@ int main(){
 
     }
 
-    // Initialize the FFT library
-
     // Initialize BLE
     // start event queue in a background thread so BLE events are processed
     static Thread ble_event_thread;
@@ -146,19 +166,34 @@ int main(){
     ble_instance.onEventsToProcess(schedule_ble_events);
     ble_instance.init(on_ble_init_complete);
 
+    // Initialize the FFT library
     arm_rfft_fast_init_f32(&S, FFT_SIZE);
 
     // Sample interval counter
     int sample_interval = 0;
     
+    printf("=== Parkinson's Monitor Started ===\r\n");
+    
     // Main loop
     while (1){
 
-        // Read raw accelerometer values, convert to g, and remove gravity offset
+        // Read raw accelerometer values, convert to g
         float acc_x_g = ( read_16bit_value(OUTX_L_XL, OUTX_H_XL) * ACC_SENSITIVITY / 1000.0f );
         float acc_y_g = ( read_16bit_value(OUTY_L_XL, OUTY_H_XL) * ACC_SENSITIVITY / 1000.0f );
-        float acc_z_g = ( read_16bit_value(OUTZ_L_XL, OUTZ_H_XL) * ACC_SENSITIVITY / 1000.0f ) - 1.0f; // Subtract 1g for gravity
-        float acc_magnitude = sqrtf( acc_x_g * acc_x_g + acc_y_g * acc_y_g + acc_z_g * acc_z_g ); // Magnitude
+        float acc_z_g = ( read_16bit_value(OUTZ_L_XL, OUTZ_H_XL) * ACC_SENSITIVITY / 1000.0f );
+        
+        // ADDED: Read gyroscope for enhanced detection
+        float gyro_x_dps = read_16bit_value(OUTX_L_G, OUTX_H_G) * GYRO_SENSITIVITY / 1000.0f;
+        float gyro_y_dps = read_16bit_value(OUTY_L_G, OUTY_H_G) * GYRO_SENSITIVITY / 1000.0f;
+        float gyro_z_dps = read_16bit_value(OUTZ_L_G, OUTZ_H_G) * GYRO_SENSITIVITY / 1000.0f;
+        
+        // Calculate magnitudes
+        float acc_z_nograv = acc_z_g - 1.0f; // Remove gravity for FFT
+        float acc_magnitude = sqrtf( acc_x_g * acc_x_g + acc_y_g * acc_y_g + acc_z_nograv * acc_z_nograv );
+        float gyro_magnitude = sqrtf( gyro_x_dps * gyro_x_dps + gyro_y_dps * gyro_y_dps + gyro_z_dps * gyro_z_dps );
+        
+        // ADDED: Detect steps using vertical acceleration (Z-axis with gravity)
+        detect_step( acc_z_g );
 
         // Process accelerometer magnitude through FFT
         fft( acc_magnitude );
@@ -171,29 +206,56 @@ int main(){
         
             // Determine oscillation state
             OscillationState state = determine_oscillation_state( current_dominant_freq );
+            
+            // ADDED: Calculate intensity from FFT magnitude
+            uint8_t intensity = calculate_intensity( current_fft_magnitude );
 
-            // --- keep EXACT same prints as original ---
+            // Teleplot output for visualization
+            printf(">frequency:%.2f\r\n", current_dominant_freq);
+            printf(">intensity:%d\r\n", intensity);
+            printf(">steps:%d\r\n", steps_in_window);
+            printf(">osc_state:%d\r\n", (int)state);  // 0=NORMAL, 1=TREMOR, 2=DYSKINESIA, 3=OUT_OF_RANGE
+            
+            // Determine movement state - MODIFIED to use steps
+            MovementState move_state = determine_movement_state( current_dominant_freq, steps_in_window );
+            printf(">move_state:%d\r\n", (int)move_state);  // 0=IDLE, 1=WALKING, 2=FREEZED
+            
+            // Also print human-readable for debugging
             if( state == NORMAL ) printf("NORMAL (%.2f Hz)\r\n", current_dominant_freq);
-            else if( state == TREMOR ) printf("TREMOR (%.2f Hz)\r\n", current_dominant_freq);
-            else if( state == DYSKINESIA ) printf("DYSKINESIA (%.2f Hz)\r\n", current_dominant_freq);
+            else if( state == TREMOR ) printf("TREMOR (%.2f Hz, intensity: %d)\r\n", current_dominant_freq, intensity);
+            else if( state == DYSKINESIA ) printf("DYSKINESIA (%.2f Hz, intensity: %d)\r\n", current_dominant_freq, intensity);
             else printf("OUT OF RANGE (%.2f Hz)\r\n", current_dominant_freq);
 
-            // Determine movement state
-            MovementState move_state = determine_movement_state( current_dominant_freq );
-            if( move_state == IDLE ) printf("Movement State: IDLE\r\n");
-            else if( move_state == WALKING ) printf("Movement State: WALKING\r\n");
+            if( move_state == IDLE ) printf("Movement State: IDLE (steps: %d)\r\n", steps_in_window);
+            else if( move_state == WALKING ) printf("Movement State: WALKING (steps: %d)\r\n", steps_in_window);
             else if( move_state == FREEZED ) printf("Movement State: FREEZED\r\n");
-
-            // Update BLE characteristics (if BLE initialized)
-            if (ble_ready) {
-                // Tremor characteristic: set to 1 when oscillation in tremor range
-                tremor_val = (state == TREMOR) ? 1 : 0;
-                dyskinesia_val = (state == DYSKINESIA) ? 1 : 0;
-                freeze_val = (move_state == FREEZED) ? 1 : 0;
+            
+            // Reset steps for next window
+            steps_in_window = 0;
+            
+            // MODIFIED: Update BLE characteristic with symptom string (only if not NONE)
+            if (ble_ready && symptomCharPtr) {
+                const char* symptom_to_send = nullptr;
                 
-                if (tremorCharPtr) ble_instance.gattServer().write(tremorCharPtr->getValueHandle(), &tremor_val, sizeof(tremor_val));
-                if (dyskCharPtr)  ble_instance.gattServer().write(dyskCharPtr->getValueHandle(),  &dyskinesia_val, sizeof(dyskinesia_val));
-                if (freezeCharPtr)ble_instance.gattServer().write(freezeCharPtr->getValueHandle(), &freeze_val, sizeof(freeze_val));
+                // Priority: FOG > DYSKINESIA > TREMOR (skip NONE)
+                if (move_state == FREEZED) {
+                    symptom_to_send = SYMPTOM_FOG;
+                } else if (state == DYSKINESIA) {
+                    symptom_to_send = SYMPTOM_DYSKINESIA;
+                } else if (state == TREMOR) {
+                    symptom_to_send = SYMPTOM_TREMOR;
+                }
+                
+                // Only send if we have a symptom to report
+                if (symptom_to_send != nullptr) {
+                    strcpy((char*)symptom_string, symptom_to_send);
+                    ble_instance.gattServer().write(
+                        symptomCharPtr->getValueHandle(),
+                        symptom_string,
+                        strlen(symptom_to_send) + 1
+                    );
+                    printf("BLE Sent: %s\r\n", symptom_to_send);
+                }
             }
 
             // Save states for LED UI
@@ -237,13 +299,13 @@ uint8_t read_register( uint8_t reg ){
 int16_t read_16bit_value( uint8_t low_reg, uint8_t high_reg ){
 
     // Read low byte
-    char low_byte = read_register(low_reg);
+    uint8_t low_byte = read_register(low_reg);
     
     // Read high byte
-    char high_byte = read_register(high_reg);
+    uint8_t high_byte = read_register(high_reg);
     
     // Combine the bytes (little-endian: low byte first)
-    return (high_byte << 8) | low_byte;
+    return (int16_t)((high_byte << 8) | low_byte);
 
 }
 
@@ -253,14 +315,63 @@ bool configure_device(){
     // Setup I2C at 400kHz
     i2c.frequency(400000);
     
-    // Verify devicd id   
+    // Verify device id   
     if( read_register(WHO_AM_I) != 0x6A ) return false;
     
     // Configure the accelerometer (52 Hz, ±2g range)
     write_register(CTRL1_XL, 0x30); // ODR = 52 Hz (0011), FS = ±2g (00)
+    
+    // ADDED: Configure the gyroscope (52 Hz, ±250 dps range)
+    write_register(CTRL2_G, 0x30); // ODR = 52 Hz (0011), FS = ±250 dps (00)
 
     return true; 
 
+}
+
+// ADDED: Step detection using Z-axis acceleration threshold crossing
+void detect_step( float acc_z ){
+    
+    // Update running average (slow adaptation)
+    acc_vertical_avg = acc_vertical_avg * 0.99f + acc_z * 0.01f;
+    
+    // Decrease cooldown
+    if( step_cooldown > 0 ) step_cooldown--;
+    
+    // Step detection: look for acceleration going above threshold then back down
+    // A step causes a brief spike in vertical acceleration
+    float threshold_high = acc_vertical_avg + 0.15f;  // Above baseline
+    float threshold_low = acc_vertical_avg + 0.05f;   // Return to near baseline
+    
+    if( !step_detected && step_cooldown == 0 ){
+        // Looking for rising edge (foot strike)
+        if( acc_z > threshold_high && acc_vertical_prev <= threshold_high ){
+            step_detected = true;
+        }
+    }
+    else if( step_detected ){
+        // Looking for falling edge (foot lift)
+        if( acc_z < threshold_low ){
+            step_detected = false;
+            step_count++;
+            steps_in_window++;
+            step_cooldown = 10;  // ~200ms cooldown at 52Hz
+        }
+    }
+    
+    acc_vertical_prev = acc_z;
+}
+
+// ADDED: Calculate intensity level (1-255) from FFT magnitude
+uint8_t calculate_intensity( float magnitude ){
+    
+    if( magnitude < 0.3f ) return 1;  // Minimum intensity
+    
+    // Scale magnitude to 1-255 range
+    // Typical tremor/dyskinesia magnitudes: 0.3 to 10
+    float scaled = (magnitude - 0.3f) / 9.7f;  // Normalize to 0-1
+    if( scaled > 1.0f ) scaled = 1.0f;
+    
+    return (uint8_t)(scaled * 254.0f) + 1;  // Map to 1-255
 }
 
 // Process input signal through FFT to find dominant frequency
@@ -297,8 +408,14 @@ void fft( float input_signal ){
         
         // 4. Convert Bin Index to Hz
         // Add threshold to filter noise
-        if (max_val > 0.3f) current_dominant_freq = max_bin * FREQ_BIN_SIZE;
-        else current_dominant_freq = 0.0f;
+        if (max_val > 0.3f){
+            current_dominant_freq = max_bin * FREQ_BIN_SIZE;
+            current_fft_magnitude = max_val;  // ADDED: Store magnitude
+        }
+        else{
+            current_dominant_freq = 0.0f;
+            current_fft_magnitude = 0.0f;
+        }
         
         // Reset index to start filling buffer again
         fft_idx = 0;
@@ -318,67 +435,101 @@ OscillationState determine_oscillation_state( float frequency ){
 
 }
 
-// Determine Movement State based on Frequency
-MovementState determine_movement_state( float frequency ){
+// MODIFIED: Determine Movement State based on Frequency AND Steps
+MovementState determine_movement_state( float frequency, int steps ){
 
-    // Initalize initial state
+    // Initialize initial state
     static MovementState current_state = IDLE;
 
-    // Initalize iniitial previous frequency
+    // Initialize initial previous frequency
     static float prev_dominant_freq_local = 0.0f;
+    
+    // ADDED: Track consecutive walking windows for FOG detection
+    static int walking_window_count = 0;
 
     // ---- handle reset request from long button press ----
     if (g_reset_flag) {
         current_state = IDLE;
         prev_dominant_freq_local = 0.0f;
+        walking_window_count = 0;
+        step_count = 0;
         g_reset_flag = false;
         return current_state;
     }
 
     // Calculate frequency change 
     float delta = frequency - prev_dominant_freq_local;
+    
+    // ADDED: Use steps to help determine walking
+    bool has_steps = (steps >= 2);  // At least 2 steps in 3 seconds
+    bool in_walk_freq = (frequency >= WALK_MIN_FREQ && frequency <= WALK_MAX_FREQ);
 
     switch (current_state) {
 
         case IDLE:
 
-            // IDLE -> WALKING if we clearly enter walking band with change
-            if (frequency >= WALK_MIN_FREQ && frequency <= WALK_MAX_FREQ && fabsf(delta) > BIG_CHANGE_TH) current_state = WALKING;
-
-            // stay IDLE
-            else  current_state = IDLE;
-
+            // MODIFIED: IDLE -> WALKING if steps detected OR frequency in walking band with change
+            if( has_steps || (in_walk_freq && fabsf(delta) > BIG_CHANGE_TH) ){
+                current_state = WALKING;
+                walking_window_count = 1;
+            }
+            else{
+                current_state = IDLE;
+            }
             break;
 
         case WALKING:
 
-            // WALKING -> FREEZED: big DROP into low frequency
-            if (frequency < LOW_FREQ_TH && delta < BIG_DROP_TH) current_state = FREEZED;
-
-            // WALKING -> IDLE: just smoothly slowed down
-            else if (frequency < LOW_FREQ_TH && fabsf(delta) <= BIG_CHANGE_TH) current_state = IDLE;
-
-            // stay WALKING
-            else current_state = WALKING;
-
+            walking_window_count++;
+            
+            // MODIFIED: WALKING -> FREEZED: Need sustained walking first, then sudden stop
+            // FOG requires: walking for at least 3 windows (~9 sec), then sudden frequency drop with no steps
+            if( walking_window_count >= 3 && frequency < LOW_FREQ_TH && !has_steps && delta < BIG_DROP_TH ){
+                current_state = FREEZED;
+                walking_window_count = 0;
+            }
+            // WALKING -> IDLE: gradual stop (low freq, no steps, small change)
+            else if( frequency < LOW_FREQ_TH && !has_steps && fabsf(delta) <= BIG_CHANGE_TH ){
+                current_state = IDLE;
+                walking_window_count = 0;
+            }
+            // Stay WALKING if still have steps or in walking frequency band
+            else if( has_steps || in_walk_freq ){
+                current_state = WALKING;
+            }
+            // Otherwise transition to IDLE
+            else{
+                current_state = IDLE;
+                walking_window_count = 0;
+            }
             break;
 
         case FREEZED:
 
-            // FREEZED -> WALKING: walking band with noticeable change
-            if (frequency >= WALK_MIN_FREQ && frequency <= WALK_MAX_FREQ && fabsf(delta) > BIG_CHANGE_TH) current_state = WALKING;
-
-            // FREEZED -> IDLE: stays low without big changes
-            else if (frequency < LOW_FREQ_TH && fabsf(delta) <= BIG_CHANGE_TH) current_state = IDLE;
-
+            // FREEZED -> WALKING: resume walking (steps or walking frequency)
+            if( has_steps || (in_walk_freq && fabsf(delta) > BIG_CHANGE_TH) ){
+                current_state = WALKING;
+                walking_window_count = 1;
+            }
+            // FREEZED -> IDLE: stays low without big changes for extended time
+            else if (frequency < LOW_FREQ_TH && fabsf(delta) <= BIG_CHANGE_TH){
+                static int freeze_duration = 0;
+                freeze_duration++;
+                if( freeze_duration >= 3 ){  // ~9 seconds in freeze
+                    current_state = IDLE;
+                    freeze_duration = 0;
+                }
+            }
             // else remain FREEZED
-            else current_state = FREEZED;
-
+            else{
+                current_state = FREEZED;
+            }
             break;
 
         default:
 
             current_state = IDLE; // safety fallback
+            walking_window_count = 0;
             break;
 
     }
@@ -475,7 +626,7 @@ void update_led_pattern() {
 }
 
 // -------- Button handling: long press -> reset states --------
-//  - short press: ignored
+//  - short press: show step count
 //  - long press (~>=600ms): set g_reset_flag, real reset done in determine_movement_state()
 void handle_button() {
 
@@ -499,6 +650,11 @@ void handle_button() {
             g_reset_flag = true;
             printf("[BUTTON] Long press detected. Resetting states...\r\n");
         }
+        else if (duration_ms >= 50) {
+            // ADDED: Short press - show current status
+            printf("[BUTTON] Total steps: %d, Current symptom: %s\r\n", 
+                   step_count, (char*)symptom_string);
+        }
 
         // Reset counter after release
         press_ticks = 0;
@@ -506,35 +662,6 @@ void handle_button() {
 
     prev_pressed = pressed;
 }
-
-
-/* maybe not needed
-
-#define CTRL2_G      (0x11) // Gyroscope control register to configure range
-#define OUTX_L_G     (0x22) // Gyro X-axis (low byte)
-#define OUTX_H_G     (0x23) // Gyro X-axis (high byte)
-#define OUTY_L_G     (0x24) // Gyro Y-axis (low byte)
-#define OUTY_H_G     (0x25) // Gyro Y-axis (high byte)
-#define OUTZ_L_G     (0x26) // Gyro Z-axis (low byte)
-#define OUTZ_H_G     (0x27) // Gyro Z-axis (high byte)
-
-//const float GYRO_SENSITIVITY = 8.75f; // mdps/LSB for ±250 dps
-
---- configure device function
-// Configure the gyroscope (52 Hz, ±250 dps range)
-write_register(CTRL2_G, 0x30); // ODR = 52 Hz (0011), FS = ±250 dps (00)
----
-
-// Read raw gyroscope values and convert to dps
-float gyro_x_dps = read_16bit_value(OUTX_L_G, OUTX_H_G) * GYRO_SENSITIVITY / 1000.0f;
-float gyro_y_dps = read_16bit_value(OUTY_L_G, OUTY_H_G) * GYRO_SENSITIVITY / 1000.0f;
-float gyro_z_dps = read_16bit_value(OUTZ_L_G, OUTZ_H_G) * GYRO_SENSITIVITY / 1000.0f;
-float gyro_magnitude = sqrtf( gyro_x_dps * gyro_x_dps + gyro_y_dps * gyro_y_dps + gyro_z_dps * gyro_z_dps ); // Magnitude
-
-// Process gyroscope magnitude through FFT
-fft( gyro_magnitude );
-
-*/
 
 // Schedule BLE events on the event queue
 void schedule_ble_events(ble::BLE::OnEventsToProcessCallbackContext* context) {
@@ -551,14 +678,17 @@ void on_ble_init_complete(ble::BLE::InitializationCompleteCallbackContext* param
 
     ble::BLE &local_ble = params->ble;
 
-    // Create three characteristics (tremor, dyskinesia, freezing gait)
-    tremorCharPtr = new GattCharacteristic(UUID("0000a001-0000-1000-8000-00805f9b34fb"), &tremor_val, sizeof(tremor_val), sizeof(tremor_val), GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_NOTIFY | GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_READ);
-    dyskCharPtr   = new GattCharacteristic(UUID("0000a002-0000-1000-8000-00805f9b34fb"), &dyskinesia_val, sizeof(dyskinesia_val), sizeof(dyskinesia_val), GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_NOTIFY | GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_READ);
-    freezeCharPtr = new GattCharacteristic(UUID("0000a003-0000-1000-8000-00805f9b34fb"), &freeze_val, sizeof(freeze_val), sizeof(freeze_val), GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_NOTIFY | GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_READ);
+    // MODIFIED: Create ONE string characteristic for symptom name
+    strcpy((char*)symptom_string, SYMPTOM_NONE);  // Initialize to "NONE"
+    symptomCharPtr = new GattCharacteristic(
+        UUID("0000a001-0000-1000-8000-00805f9b34fb"),
+        symptom_string, 1, MAX_SYMPTOM_LEN,
+        GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_NOTIFY | GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_READ
+    );
 
-    GattCharacteristic *char_table[] = { tremorCharPtr, dyskCharPtr, freezeCharPtr };
+    GattCharacteristic *char_table[] = { symptomCharPtr };
 
-    // Custom service UUID(Testing needed)
+    // Custom service UUID
     const UUID service_uuid("0000a000-0000-1000-8000-00805f9b34fb");
     GattService custom_service(service_uuid, char_table, sizeof(char_table) / sizeof(char_table[0]));
 
@@ -573,6 +703,7 @@ void on_ble_init_complete(ble::BLE::InitializationCompleteCallbackContext* param
     ble::AdvertisingDataBuilder adv_builder(adv_buffer);
     adv_builder.clear();
     adv_builder.setFlags();
+    adv_builder.setName("Parkinsons Monitor");
 
     // Add 128-bit service UUID using mbed::Span
     mbed::Span<const unsigned char> svc_span(reinterpret_cast<const unsigned char*>(service_uuid_bytes), sizeof(service_uuid_bytes));
